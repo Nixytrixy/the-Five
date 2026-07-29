@@ -237,6 +237,10 @@ def main() -> None:
         _board_cache = jp.board()
     except jp.AuthError:
         raise
+    jp.log(f"board: phase={_board_cache.get('phase')!r} "
+           f"boards={list(_board_cache.get('boards', {}).keys())} "
+           f"live={jp.live_board(_board_cache)!r} "
+           f"open_tiles={len(jp.open_tiles(_board_cache))}")
 
     poller = threading.Thread(target=_board_poller, daemon=True)
     poller.start()

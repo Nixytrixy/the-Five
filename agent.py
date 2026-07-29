@@ -176,16 +176,16 @@ def solve_tile(task_id: str, verbose: bool = False,
     state: dict = {"answer": None, "done": False}
 
     for _turn in range(MAX_TURNS):
-        if still_valid is not None and not still_valid():
-            if verbose:
-                jp.log(f"{task_id}: tile claimed mid-solve, abandoning at turn {_turn}")
-            return None, detail
-
         resp = client.messages.create(
             model=jp.MODEL, max_tokens=2048,
             system=system, tools=tools.TOOLS, messages=messages,
         )
         messages.append({"role": "assistant", "content": resp.content})
+
+        if still_valid is not None and not still_valid():
+            if verbose:
+                jp.log(f"{task_id}: tile claimed mid-solve, abandoning at turn {_turn}")
+            return None, detail
 
         tool_uses = [b for b in resp.content if b.type == "tool_use"]
         if not tool_uses:
