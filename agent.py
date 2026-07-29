@@ -22,6 +22,15 @@ import tools
 MAX_TURNS = 14
 ANSWER_RE = re.compile(r"^ANSWER:\s*(.*)$", re.MULTILINE)
 
+CATEGORY_MAX_TURNS: dict[str, int] = {
+    "Needle in the Haystack": 8,
+    "Ship It":                8,
+    "Cryptic":                10,
+    "Heavy Compute":          14,
+    "Ancient Scrolls":        10,
+    "The Dark Web":           14,
+}
+
 # Short, category-specific steering. Keeps a small model (Haiku) from
 # reaching for the wrong tool or guessing instead of computing.
 CATEGORY_HINTS = {
@@ -148,7 +157,8 @@ def _run_tool(tu, task_id: str, workdir: str, state: dict) -> dict:
             "content": f"unknown tool {tu.name}"}
 
 
-def solve_tile(task_id: str, verbose: bool = False) -> tuple[str | None, dict]:
+def solve_tile(task_id: str, verbose: bool = False,
+               is_open=None) -> tuple[str | None, dict]:
     """Attempt one tile end-to-end. Returns (answer_or_None, task_detail).
 
     Never raises jp.TileUnavailable/AuthError itself for the "no answer"
@@ -172,8 +182,13 @@ def solve_tile(task_id: str, verbose: bool = False) -> tuple[str | None, dict]:
         jp.log(f"{task_id} system:\n{system}\n---\nuser:\n{messages[0]['content']}\n---")
 
     state: dict = {"answer": None, "done": False}
+    category = detail.get("category", "")
+    turns = CATEGORY_MAX_TURNS.get(category, MAX_TURNS)
 
-    for _turn in range(MAX_TURNS):
+    for _turn in range(turns):
+        if is_open is not None and not is_open(task_id):
+            jp.log(f"{task_id}: claimed by another team, stopping")
+            return None, detail
         resp = client.messages.create(
             model=jp.MODEL, max_tokens=2048,
             system=system, tools=tools.TOOLS, messages=messages,

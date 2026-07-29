@@ -72,7 +72,7 @@ def _backoff_seconds(misses: int) -> float:
 def attempt(task_id: str) -> None:
     """Solve one tile (blocking) and submit it. Runs in a worker thread."""
     try:
-        answer, detail = agent.solve_tile(task_id, verbose=VERBOSE)
+        answer, detail = agent.solve_tile(task_id, verbose=VERBOSE, is_open=_is_tile_open)
     except jp.AuthError:
         with _state_lock:
             _inflight.discard(task_id)
@@ -144,10 +144,35 @@ def attempt(task_id: str) -> None:
             _inflight.discard(task_id)
 
 
+CATEGORY_SPEED: dict[str, float] = {
+    "Needle in the Haystack": 1.2,
+    "Ship It":                1.2,
+    "Cryptic":                1.0,
+    "Heavy Compute":          0.9,
+    "Ancient Scrolls":        0.9,
+    "The Dark Web":           0.7,
+}
+
+
+def _is_tile_open(task_id: str) -> bool:
+    """Return False if the tile has disappeared from open_ids on the cached board,
+    meaning another team claimed it. Uses the cached board — no network call."""
+    with _board_lock:
+        b = _board_cache
+    if not b:
+        return True
+    live = jp.live_board(b)
+    for cat in b.get("boards", {}).get(live, []):
+        for cell in cat.get("tiles", []):
+            if task_id in (cell.get("open_ids") or []):
+                return True
+    return False
+
+
 def pick_next(b: dict, slots: int) -> list[str]:
-    """Points-first, one tile per cell before a second tile in any cell --
-    width first, matching the README's 'a serial agent watches the rest
-    vanish' warning. Skips solved, in-flight, and cooling-down tiles."""
+    """Points × category-speed first, one tile per cell before a second --
+    width first so no tile vanishes while we're still on the first pass.
+    Skips solved, in-flight, and cooling-down tiles."""
     now = time.monotonic()
     with _state_lock:
         solved, inflight, cooldowns = set(_solved), set(_inflight), dict(_cooldown_until)
@@ -161,6 +186,10 @@ def pick_next(b: dict, slots: int) -> list[str]:
     if TASK_FILTER:
         wanted = set(TASK_FILTER)
         candidates = [t for t in candidates if t["id"] in wanted]
+
+    candidates.sort(
+        key=lambda t: -t.get("points", 0) * CATEGORY_SPEED.get(t.get("category", ""), 1.0)
+    )
 
     seen_cells: set[tuple] = set()
     first_pass, rest = [], []
@@ -197,11 +226,17 @@ def main() -> None:
     jp.log(f"starting: MAX_WORKERS={MAX_WORKERS} POLL_INTERVAL={POLL_INTERVAL}s "
            f"MAX_TILES={MAX_TILES or 'unlimited'} TASK_FILTER={TASK_FILTER or 'none'}")
 
-    # Prime the cache before starting workers
+    # Prime the cache and seed _solved from the server so tiles we already
+    # claimed in a previous run are never re-attempted.
     try:
         _board_cache = jp.board()
     except jp.AuthError:
         raise
+    server_solved = set((_board_cache.get("you") or {}).get("solved_ids") or [])
+    if server_solved:
+        with _state_lock:
+            _solved.update(server_solved)
+        jp.log(f"resuming: {len(server_solved)} tiles already solved, skipping them")
 
     poller = threading.Thread(target=_board_poller, daemon=True)
     poller.start()

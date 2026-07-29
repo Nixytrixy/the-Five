@@ -21,6 +21,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
+from requests.adapters import HTTPAdapter
 
 BASE = os.environ.get("JEOPARDY_BASE_URL", "").rstrip("/")
 KEY = os.environ.get("TEAM_API_KEY", "")
@@ -31,6 +32,9 @@ if not BASE or not KEY:
 
 _s = requests.Session()
 _s.headers["X-Api-Key"] = KEY
+_adapter = HTTPAdapter(pool_connections=4, pool_maxsize=64)
+_s.mount("https://", _adapter)
+_s.mount("http://", _adapter)
 
 
 # ---------------------------------------------------------------- errors
@@ -278,17 +282,26 @@ def me() -> dict:
 
 # ---------------------------------------------------------------- the model
 
+_anthropic_client = None
+_anthropic_client_lock = __import__("threading").Lock()
+
+
 def anthropic_client():
     """An Anthropic SDK client pointed at the event proxy.
 
-    The proxy forces one model for everyone regardless of what you request,
-    and your agent's sandbox has no other network access — so this is the
-    only model you get. The competition is what you build around it.
+    Singleton — all tiles share one client and one connection pool so the
+    first model call doesn't pay TLS-handshake cost on every worker thread.
     """
-    from anthropic import Anthropic
-    return Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", KEY),
-                     base_url=os.environ.get("ANTHROPIC_BASE_URL",
-                                             f"{BASE}/anthropic"))
+    global _anthropic_client
+    if _anthropic_client is None:
+        with _anthropic_client_lock:
+            if _anthropic_client is None:
+                from anthropic import Anthropic
+                _anthropic_client = Anthropic(
+                    api_key=os.environ.get("ANTHROPIC_API_KEY", KEY),
+                    base_url=os.environ.get("ANTHROPIC_BASE_URL",
+                                            f"{BASE}/anthropic"))
+    return _anthropic_client
 
 
 MODEL = os.environ.get("MODEL", "claude-haiku-4-5")
