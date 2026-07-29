@@ -69,10 +69,32 @@ def _backoff_seconds(misses: int) -> float:
     return min(30 * (2 ** max(0, misses - 1)), 8 * 60)
 
 
+def _is_open(task_id: str) -> bool:
+    """Return True if task_id still appears in open_ids on the cached board.
+
+    Uses the poller's cache — no extra HTTP call. Fails open (True) if the
+    cache isn't populated yet so a startup race never silently drops a tile.
+    """
+    with _board_lock:
+        b = _board_cache
+    if b is None:
+        return True
+    return any(t["id"] == task_id for t in jp.open_tiles(b))
+
+
 def attempt(task_id: str) -> None:
     """Solve one tile (blocking) and submit it. Runs in a worker thread."""
+    if not _is_open(task_id):
+        jp.log(f"{task_id}: already claimed — skipping")
+        with _state_lock:
+            _inflight.discard(task_id)
+            _solved.add(task_id)
+        return
+
     try:
-        answer, detail = agent.solve_tile(task_id, verbose=VERBOSE)
+        answer, detail = agent.solve_tile(
+            task_id, verbose=VERBOSE, still_valid=lambda: _is_open(task_id)
+        )
     except jp.AuthError:
         with _state_lock:
             _inflight.discard(task_id)
@@ -91,12 +113,25 @@ def attempt(task_id: str) -> None:
         return
 
     if answer is None:
+        if not _is_open(task_id):
+            jp.log(f"{task_id}: claimed while solving — abandoning cleanly")
+            with _state_lock:
+                _inflight.discard(task_id)
+                _solved.add(task_id)
+            return
         jp.log(f"{task_id}: no answer captured (category="
                f"{detail.get('category') if detail else '?'})")
         with _state_lock:
             _miss_count[task_id] = _miss_count.get(task_id, 0) + 1
             _cooldown_until[task_id] = time.monotonic() + _backoff_seconds(_miss_count[task_id])
             _inflight.discard(task_id)
+        return
+
+    if not _is_open(task_id):
+        jp.log(f"{task_id}: claimed while solving — discarding answer")
+        with _state_lock:
+            _inflight.discard(task_id)
+            _solved.add(task_id)
         return
 
     try:

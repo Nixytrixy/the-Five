@@ -148,12 +148,14 @@ def _run_tool(tu, task_id: str, workdir: str, state: dict) -> dict:
             "content": f"unknown tool {tu.name}"}
 
 
-def solve_tile(task_id: str, verbose: bool = False) -> tuple[str | None, dict]:
+def solve_tile(task_id: str, verbose: bool = False,
+               still_valid=None) -> tuple[str | None, dict]:
     """Attempt one tile end-to-end. Returns (answer_or_None, task_detail).
 
-    Never raises jp.TileUnavailable/AuthError itself for the "no answer"
-    case -- those propagate to the caller, which knows how to route them
-    (skip vs. fatal).
+    `still_valid` is an optional zero-argument callable checked at the start
+    of each turn. If it returns False the loop exits immediately with
+    (None, detail) so the caller can free the worker slot without waiting
+    for MAX_TURNS to expire.
     """
     detail = jp.task(task_id)
     workdir = jp.workdir(task_id)
@@ -174,6 +176,11 @@ def solve_tile(task_id: str, verbose: bool = False) -> tuple[str | None, dict]:
     state: dict = {"answer": None, "done": False}
 
     for _turn in range(MAX_TURNS):
+        if still_valid is not None and not still_valid():
+            if verbose:
+                jp.log(f"{task_id}: tile claimed mid-solve, abandoning at turn {_turn}")
+            return None, detail
+
         resp = client.messages.create(
             model=jp.MODEL, max_tokens=2048,
             system=system, tools=tools.TOOLS, messages=messages,
