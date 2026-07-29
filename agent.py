@@ -1,18 +1,8 @@
-"""The tool-use loop: one tile in, a verified answer out.
-
-This is the piece the naive baseline main.py doesn't have. Given a task_id,
-`solve_tile` builds a category-tailored system prompt, hands the model three
-tools (run_python, http_request, submit_answer), and drives the Anthropic
-tool-use loop -- call, execute, feed results back, repeat -- until the model
-calls submit_answer with a captured ANSWER line, or MAX_TURNS runs out.
-
-Deliberately does NOT submit to the game server. main.py owns submission so
-many tiles can be solved concurrently while all their submits still funnel
-through one rate-limited gate.
-"""
+"""The tool-use loop for one Agent Jeopardy tile."""
 from __future__ import annotations
 
 import json
+import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -20,10 +10,23 @@ import jeopardy as jp
 import tools
 
 MAX_TURNS = 14
-ANSWER_RE = re.compile(r"^ANSWER:\s*(.*)$", re.MULTILINE)
+# The message history is re-sent in full every turn, so fed-back tool output is
+# the biggest per-tile lever under the shared 95k tokens/min limit. Trim it; the
+# tiny captured_answer field is kept whole (placed first so truncation can't eat
+# it). Both env-tunable for calibration.
+MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "1536"))
+TOOL_RESULT_CHARS = int(os.environ.get("TOOL_RESULT_CHARS", "3000"))
+ANSWER_RE = re.compile(r"^ANSWER:\s*(.*?)\s*$", re.MULTILINE)
 
-# Short, category-specific steering. Keeps a small model (Haiku) from
-# reaching for the wrong tool or guessing instead of computing.
+CATEGORY_MAX_TURNS: dict[str, int] = {
+    "Needle in the Haystack": 8,
+    "Ship It": 8,
+    "Cryptic": 10,
+    "Heavy Compute": 14,
+    "Ancient Scrolls": 10,
+    "The Dark Web": 14,
+}
+
 CATEGORY_HINTS = {
     "Needle in the Haystack": (
         "Messy-data wrangling at a size you cannot eyeball. Load the file(s) "
@@ -76,7 +79,8 @@ def _system_prompt(detail: dict, workdir: str) -> str:
         "You are solving one tile of Agent Jeopardy using tools. You cannot "
         "solve this from memory or by guessing -- the data is real and "
         f"lives on disk at {workdir}.\n\n"
-        f"Category: {category or 'unknown'}. {CATEGORY_HINTS.get(category, '')}\n\n"
+        f"Category: {category or 'unknown'}. "
+        f"{CATEGORY_HINTS.get(category, '')}\n\n"
         f"Answer checking: {fmt}. {_FORMAT_HINTS.get(fmt, '')}\n\n"
         "Rules:\n"
         "- Use run_python and http_request to gather ground truth. Never "
@@ -88,23 +92,38 @@ def _system_prompt(detail: dict, workdir: str) -> str:
         "of a run_python call in the exact form `ANSWER: <value>` -- make "
         "sure that line holds exactly the right string/number/literal and "
         "nothing else appended.\n"
-        "- Then call submit_answer to confirm. You do not retype the answer "
-        "there; it is pulled from your ANSWER line automatically.\n"
+        "- The harness captures the ANSWER line programmatically. Never "
+        "retype the answer into another tool call.\n"
+        "- Once the ANSWER line is printed, call submit_answer. The harness "
+        "uses the captured string, so you do not type the answer there.\n"
         f"- You have at most {MAX_TURNS} tool calls total. Work efficiently; "
         "don't re-explore what you've already established."
     )
 
 
-def _run_tools_parallel(tool_uses, task_id: str, workdir: str, state: dict) -> list[dict]:
-    """Run a batch of tool calls in parallel; submit_answer always runs last."""
+def _capture_answer(stdout: str) -> str | None:
+    """Capture the final ANSWER line exactly once, in Python."""
+    matches = ANSWER_RE.findall(stdout or "")
+    return matches[-1] if matches else None
+
+
+def _run_tools_parallel(
+    tool_uses,
+    task_id: str,
+    workdir: str,
+    state: dict,
+) -> list[dict]:
+    """Run non-submit tools concurrently; submit_answer always runs last."""
     non_submit = [tu for tu in tool_uses if tu.name != "submit_answer"]
-    submits    = [tu for tu in tool_uses if tu.name == "submit_answer"]
+    submits = [tu for tu in tool_uses if tu.name == "submit_answer"]
     result_map: dict[str, dict] = {}
 
     if non_submit:
         with ThreadPoolExecutor(max_workers=len(non_submit)) as ex:
-            fs = {ex.submit(_run_tool, tu, task_id, workdir, state): tu.id
-                  for tu in non_submit}
+            fs = {
+                ex.submit(_run_tool, tu, task_id, workdir, state): tu.id
+                for tu in non_submit
+            }
             for fut in as_completed(fs):
                 result_map[fs[fut]] = fut.result()
 
@@ -115,49 +134,87 @@ def _run_tools_parallel(tool_uses, task_id: str, workdir: str, state: dict) -> l
 
 
 def _run_tool(tu, task_id: str, workdir: str, state: dict) -> dict:
-    """Execute one tool_use block, return its tool_result content dict."""
     if tu.name == "run_python":
         code = tu.input.get("code", "")
         timeout = min(int(tu.input.get("timeout") or 20), 60)
         result = tools.run_python(code, workdir, timeout=timeout)
-        m = ANSWER_RE.findall(result.get("stdout", "") or "")
-        if m:
-            state["answer"] = m[-1].strip()
-        return {"type": "tool_result", "tool_use_id": tu.id,
-                "content": json.dumps(result)[:8000]}
+
+        stdout = result.get("stdout", "") or ""
+        answer = _capture_answer(stdout)
+
+        if answer is not None:
+            state["answer"] = answer
+
+        # captured_answer first so a truncated stdout can't push it out of the
+        # serialized blob -- the model must always see what will be submitted.
+        payload = {
+            "captured_answer": answer,
+            **result,
+        }
+
+        return {
+            "type": "tool_result",
+            "tool_use_id": tu.id,
+            "content": json.dumps(payload)[:TOOL_RESULT_CHARS],
+        }
 
     if tu.name == "http_request":
         result = tools.http_request(
-            task_id, tu.input.get("method", "GET"), tu.input.get("url", ""),
-            headers=tu.input.get("headers"), params=tu.input.get("params"),
-            data=tu.input.get("data"), json_body=tu.input.get("json_body"),
+            task_id,
+            tu.input.get("method", "GET"),
+            tu.input.get("url", ""),
+            headers=tu.input.get("headers"),
+            params=tu.input.get("params"),
+            data=tu.input.get("data"),
+            json_body=tu.input.get("json_body"),
         )
-        return {"type": "tool_result", "tool_use_id": tu.id,
-                "content": json.dumps(result)[:8000]}
+        return {
+            "type": "tool_result",
+            "tool_use_id": tu.id,
+            "content": json.dumps(result)[:TOOL_RESULT_CHARS],
+        }
 
     if tu.name == "submit_answer":
         if state.get("answer") is None:
-            return {"type": "tool_result", "tool_use_id": tu.id, "is_error": True,
-                    "content": ("No ANSWER: line captured yet. Print one via "
-                                "run_python (as the last stdout line) before "
-                                "calling submit_answer.")}
+            return {
+                "type": "tool_result",
+                "tool_use_id": tu.id,
+                "is_error": True,
+                "content": (
+                    "No ANSWER: line captured yet. Print one via "
+                    "run_python (as the last stdout line) before calling "
+                    "submit_answer."
+                ),
+            }
+
         state["done"] = True
-        return {"type": "tool_result", "tool_use_id": tu.id, "content": "acknowledged"}
+        return {
+            "type": "tool_result",
+            "tool_use_id": tu.id,
+            "content": "acknowledged",
+        }
 
-    return {"type": "tool_result", "tool_use_id": tu.id, "is_error": True,
-            "content": f"unknown tool {tu.name}"}
+    return {
+        "type": "tool_result",
+        "tool_use_id": tu.id,
+        "is_error": True,
+        "content": f"unknown tool {tu.name}",
+    }
 
 
-def solve_tile(task_id: str, verbose: bool = False) -> tuple[str | None, dict]:
-    """Attempt one tile end-to-end. Returns (answer_or_None, task_detail).
-
-    Never raises jp.TileUnavailable/AuthError itself for the "no answer"
-    case -- those propagate to the caller, which knows how to route them
-    (skip vs. fatal).
-    """
-    detail = jp.task(task_id)
-    workdir = jp.workdir(task_id)
-    names = jp.fetch_files(task_id, detail, workdir)
+def solve_tile(
+    task_id: str,
+    verbose: bool = False,
+    is_open=None,
+    prefetched: tuple[dict, object, list[str]] | None = None,
+) -> tuple[str | None, dict]:
+    """Attempt one tile end-to-end using already-prefetched inputs when given."""
+    if prefetched is None:
+        detail = jp.task(task_id)
+        workdir = jp.workdir(task_id)
+        names = jp.fetch_files(task_id, detail, workdir)
+    else:
+        detail, workdir, names = prefetched
 
     client = jp.anthropic_client()
     system = _system_prompt(detail, str(workdir))
@@ -168,38 +225,84 @@ def solve_tile(task_id: str, verbose: bool = False) -> tuple[str | None, dict]:
             f"Files available in {workdir}: {names or 'none'}"
         ),
     }]
+
     if verbose:
-        jp.log(f"{task_id} system:\n{system}\n---\nuser:\n{messages[0]['content']}\n---")
+        jp.log(
+            f"{task_id} system:\n{system}\n---\n"
+            f"user:\n{messages[0]['content']}\n---"
+        )
 
     state: dict = {"answer": None, "done": False}
+    category = detail.get("category", "")
+    turns = CATEGORY_MAX_TURNS.get(category, MAX_TURNS)
 
-    for _turn in range(MAX_TURNS):
+    for _turn in range(turns):
+        if is_open is not None and not is_open(task_id):
+            jp.log(f"{task_id}: claimed by another team, stopping")
+            return None, detail
+
         resp = client.messages.create(
-            model=jp.MODEL, max_tokens=2048,
-            system=system, tools=tools.TOOLS, messages=messages,
+            model=jp.MODEL,
+            max_tokens=MAX_TOKENS,
+            system=system,
+            tools=tools.TOOLS,
+            messages=messages,
         )
         messages.append({"role": "assistant", "content": resp.content})
 
-        tool_uses = [b for b in resp.content if b.type == "tool_use"]
+        tool_uses = [
+            b for b in resp.content
+            if b.type == "tool_use"
+        ]
+
         if not tool_uses:
             if verbose:
-                text = "".join(b.text for b in resp.content if b.type == "text")
-                jp.log(f"{task_id} model (no tool call): {text[:300]}")
-            messages.append({"role": "user", "content": (
-                "Use a tool. If you already have the answer, run it through "
-                "run_python with an ANSWER: line, then call submit_answer.")})
+                text = "".join(
+                    b.text for b in resp.content
+                    if b.type == "text"
+                )
+                jp.log(
+                    f"{task_id} model (no tool call): {text[:300]}"
+                )
+
+            messages.append({
+                "role": "user",
+                "content": (
+                    "Use a tool. If you already have the answer, run it "
+                    "through run_python with an ANSWER: line, then call "
+                    "submit_answer."
+                ),
+            })
             continue
 
-        tool_results = _run_tools_parallel(tool_uses, task_id, str(workdir), state)
+        tool_results = _run_tools_parallel(
+            tool_uses,
+            task_id,
+            str(workdir),
+            state,
+        )
+
         if verbose:
             for tu, tr in zip(tool_uses, tool_results):
-                jp.log(f"{task_id} tool {tu.name}({tu.input}) -> "
-                       f"{str(tr.get('content'))[:300]}")
+                jp.log(
+                    f"{task_id} tool {tu.name}({tu.input}) -> "
+                    f"{str(tr.get('content'))[:300]}"
+                )
 
-        messages.append({"role": "user", "content": tool_results})
+        messages.append({
+            "role": "user",
+            "content": tool_results,
+        })
+
+        # The exact answer is captured by Python. submit_answer is merely
+        # the model's explicit verification/finish signal.
         if state["done"]:
             return state["answer"], detail
 
     if verbose:
-        jp.log(f"{task_id}: MAX_TURNS hit, answer so far: {state['answer']!r}")
+        jp.log(
+            f"{task_id}: MAX_TURNS hit, answer so far: "
+            f"{state['answer']!r}"
+        )
+
     return state["answer"], detail
