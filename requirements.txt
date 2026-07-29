@@ -1,0 +1,3 @@
+# Anything extra your agent needs. Installed at SUBMIT time (the sandbox
+# has no internet at runtime), so a typo here fails your deploy loudly.
+# Already in the image: anthropic httpx requests beautifulsoup4 lxml numpy pandas
