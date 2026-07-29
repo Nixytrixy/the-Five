@@ -32,8 +32,9 @@ import jeopardy as jp
 VERBOSE = os.environ.get("VERBOSE") == "1"
 TASK_FILTER = [t.strip() for t in os.environ.get("TASK_FILTER", "").split(",") if t.strip()]
 MAX_TILES = int(os.environ.get("MAX_TILES", "0"))          # 0 = no cap
-MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "8"))
+MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "20"))
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "4"))
+DISPATCH_INTERVAL = 0.2                                     # how often to check for free slots
 SUBMIT_MIN_GAP = 3.1                                        # server: 1 per 3s per team
 
 _submit_lock = threading.Lock()
@@ -44,6 +45,9 @@ _solved: set[str] = set()
 _inflight: set[str] = set()
 _cooldown_until: dict[str, float] = {}     # task_id -> time.monotonic() deadline
 _miss_count: dict[str, int] = {}
+
+_board_lock = threading.Lock()
+_board_cache: dict | None = None
 
 
 def _rate_limited_submit(task_id: str, answer: str) -> dict:
@@ -70,6 +74,8 @@ def attempt(task_id: str) -> None:
     try:
         answer, detail = agent.solve_tile(task_id, verbose=VERBOSE)
     except jp.AuthError:
+        with _state_lock:
+            _inflight.discard(task_id)
         raise                                          # fatal; stop the whole agent
     except jp.TileUnavailable as e:
         jp.log(f"{task_id}: unavailable -- {e}")
@@ -78,10 +84,11 @@ def attempt(task_id: str) -> None:
         return
     except Exception as e:  # noqa: BLE001
         jp.log(f"{task_id}: solve blew up -- {e!r}")
-        answer, detail = None, {}
-    finally:
         with _state_lock:
+            _miss_count[task_id] = _miss_count.get(task_id, 0) + 1
+            _cooldown_until[task_id] = time.monotonic() + _backoff_seconds(_miss_count[task_id])
             _inflight.discard(task_id)
+        return
 
     if answer is None:
         jp.log(f"{task_id}: no answer captured (category="
@@ -89,14 +96,19 @@ def attempt(task_id: str) -> None:
         with _state_lock:
             _miss_count[task_id] = _miss_count.get(task_id, 0) + 1
             _cooldown_until[task_id] = time.monotonic() + _backoff_seconds(_miss_count[task_id])
+            _inflight.discard(task_id)
         return
 
     try:
         result = _rate_limited_submit(task_id, answer)
     except jp.AuthError:
+        with _state_lock:
+            _inflight.discard(task_id)
         raise
     except Exception as e:  # noqa: BLE001
         jp.log(f"{task_id}: submit blew up -- {e!r}")
+        with _state_lock:
+            _inflight.discard(task_id)
         return
 
     outcome = result.get("result")
@@ -105,22 +117,31 @@ def attempt(task_id: str) -> None:
     if outcome == "correct":
         with _state_lock:
             _solved.add(task_id)
+            _inflight.discard(task_id)
     elif outcome in ("already_claimed", "voided", "unknown_task"):
         with _state_lock:
             _solved.add(task_id)          # dead work either way; stop retrying
+            _inflight.discard(task_id)
     elif outcome == "forbidden":
         jp.log("  a scored round is live -- only the HOSTED agent may submit "
                "(deploy via /api/agent/submit, or use the practice board)")
+        with _state_lock:
+            _inflight.discard(task_id)
     elif outcome in ("incorrect", "locked_out"):
         with _state_lock:
             _miss_count[task_id] = _miss_count.get(task_id, 0) + 1
             _cooldown_until[task_id] = time.monotonic() + _backoff_seconds(_miss_count[task_id])
+            _inflight.discard(task_id)
     elif outcome == "rate_limited":
         retry = float(result.get("retry_in", 3) or 3)
         with _state_lock:
             _cooldown_until[task_id] = time.monotonic() + retry
-    # "wrong_phase": leave it uncooled -- it'll be filtered out again next
-    # poll by open_tiles() as soon as the board isn't live for it.
+            _inflight.discard(task_id)
+    else:
+        # "wrong_phase" and anything unknown: release inflight, no cooldown --
+        # open_tiles() will filter it out on the next poll if it's still wrong phase.
+        with _state_lock:
+            _inflight.discard(task_id)
 
 
 def pick_next(b: dict, slots: int) -> list[str]:
@@ -156,30 +177,44 @@ def pick_next(b: dict, slots: int) -> list[str]:
     return picked
 
 
+def _board_poller() -> None:
+    """Background thread: refresh the board cache every POLL_INTERVAL seconds."""
+    global _board_cache
+    while True:
+        try:
+            b = jp.board()
+            with _board_lock:
+                _board_cache = b
+        except jp.AuthError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            jp.log(f"board poll failed -- {e!r}")
+        time.sleep(POLL_INTERVAL)
+
+
 def main() -> None:
+    global _board_cache
     jp.log(f"starting: MAX_WORKERS={MAX_WORKERS} POLL_INTERVAL={POLL_INTERVAL}s "
            f"MAX_TILES={MAX_TILES or 'unlimited'} TASK_FILTER={TASK_FILTER or 'none'}")
+
+    # Prime the cache before starting workers
+    try:
+        _board_cache = jp.board()
+    except jp.AuthError:
+        raise
+
+    poller = threading.Thread(target=_board_poller, daemon=True)
+    poller.start()
+
+    _last_log = 0.0
+
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         futures: dict[Future, str] = {}
         while True:
-            try:
-                b = jp.board()
-            except jp.AuthError:
-                raise
-            except Exception as e:  # noqa: BLE001
-                jp.log(f"board poll failed -- {e!r}")
-                time.sleep(POLL_INTERVAL)
-                continue
+            with _board_lock:
+                b = _board_cache
 
-            with _state_lock:
-                free = MAX_WORKERS - len(_inflight)
-            if free > 0:
-                for task_id in pick_next(b, free):
-                    with _state_lock:
-                        _inflight.add(task_id)
-                    fut = pool.submit(attempt, task_id)
-                    futures[fut] = task_id
-
+            # Clean up done futures
             for f in [f for f in futures if f.done()]:
                 task_id = futures.pop(f)
                 exc = f.exception()
@@ -188,14 +223,27 @@ def main() -> None:
                         raise exc
                     jp.log(f"{task_id}: worker crashed -- {exc!r}")
 
+            # Dispatch immediately whenever slots are free
             with _state_lock:
-                cooling = sum(1 for v in _cooldown_until.values() if v > time.monotonic())
-                jp.log(f"solved={len(_solved)} inflight={len(_inflight)} cooling={cooling}")
-                if MAX_TILES and len(_solved) >= MAX_TILES:
-                    jp.log(f"MAX_TILES={MAX_TILES} reached, stopping.")
-                    return
+                free = MAX_WORKERS - len(_inflight)
+            if free > 0 and b:
+                for task_id in pick_next(b, free):
+                    with _state_lock:
+                        _inflight.add(task_id)
+                    fut = pool.submit(attempt, task_id)
+                    futures[fut] = task_id
 
-            time.sleep(POLL_INTERVAL)
+            now = time.monotonic()
+            if now - _last_log >= 10:
+                with _state_lock:
+                    cooling = sum(1 for v in _cooldown_until.values() if v > now)
+                    jp.log(f"solved={len(_solved)} inflight={len(_inflight)} cooling={cooling}")
+                    if MAX_TILES and len(_solved) >= MAX_TILES:
+                        jp.log(f"MAX_TILES={MAX_TILES} reached, stopping.")
+                        return
+                _last_log = now
+
+            time.sleep(DISPATCH_INTERVAL)
 
 
 if __name__ == "__main__":

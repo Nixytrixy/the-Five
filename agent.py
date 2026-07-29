@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import jeopardy as jp
 import tools
@@ -94,6 +95,25 @@ def _system_prompt(detail: dict, workdir: str) -> str:
     )
 
 
+def _run_tools_parallel(tool_uses, task_id: str, workdir: str, state: dict) -> list[dict]:
+    """Run a batch of tool calls in parallel; submit_answer always runs last."""
+    non_submit = [tu for tu in tool_uses if tu.name != "submit_answer"]
+    submits    = [tu for tu in tool_uses if tu.name == "submit_answer"]
+    result_map: dict[str, dict] = {}
+
+    if non_submit:
+        with ThreadPoolExecutor(max_workers=len(non_submit)) as ex:
+            fs = {ex.submit(_run_tool, tu, task_id, workdir, state): tu.id
+                  for tu in non_submit}
+            for fut in as_completed(fs):
+                result_map[fs[fut]] = fut.result()
+
+    for tu in submits:
+        result_map[tu.id] = _run_tool(tu, task_id, workdir, state)
+
+    return [result_map[tu.id] for tu in tool_uses]
+
+
 def _run_tool(tu, task_id: str, workdir: str, state: dict) -> dict:
     """Execute one tool_use block, return its tool_result content dict."""
     if tu.name == "run_python":
@@ -170,7 +190,7 @@ def solve_tile(task_id: str, verbose: bool = False) -> tuple[str | None, dict]:
                 "run_python with an ANSWER: line, then call submit_answer.")})
             continue
 
-        tool_results = [_run_tool(tu, task_id, str(workdir), state) for tu in tool_uses]
+        tool_results = _run_tools_parallel(tool_uses, task_id, str(workdir), state)
         if verbose:
             for tu, tr in zip(tool_uses, tool_results):
                 jp.log(f"{task_id} tool {tu.name}({tu.input}) -> "

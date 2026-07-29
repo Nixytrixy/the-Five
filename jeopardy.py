@@ -18,6 +18,7 @@ import os
 import pathlib
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
@@ -230,8 +231,9 @@ def fetch_files(task_id: str, detail: dict,
     """
     out = pathlib.Path(dest) if dest is not None else workdir(task_id)
     out.mkdir(parents=True, exist_ok=True)
-    names = []
-    for name in detail.get("files", []):
+    names = list(detail.get("files", []))
+
+    def _download(name: str) -> None:
         path = out / name
         if not path.exists() or path.stat().st_size == 0:
             r = _s.get(f"{BASE}/api/task/{task_id}/file/{name}", timeout=120)
@@ -241,7 +243,10 @@ def fetch_files(task_id: str, detail: dict,
             _raise_for(r, f"GET /api/task/{task_id}/file/{name}",
                        unavailable=(403, 404))
             path.write_bytes(r.content)
-        names.append(name)
+
+    with ThreadPoolExecutor(max_workers=min(len(names), 8) if names else 1) as ex:
+        list(ex.map(_download, names))
+
     return names
 
 
